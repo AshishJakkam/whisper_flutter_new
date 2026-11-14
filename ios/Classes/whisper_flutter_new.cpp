@@ -225,6 +225,10 @@ struct whisper_session
 {
     struct whisper_context *ctx = nullptr;
     std::string model;
+    // The live socket and the batch runner both open a session over the same model. Without a
+    // count, the first caller to close freed the context under the other one, and every later
+    // window failed as if the model were missing.
+    int refs = 0;
 };
 
 static whisper_session g_session;
@@ -274,15 +278,21 @@ extern "C"
             if (type == "sessionOpen")
             {
                 const std::string model = jsonBody["model"];
-                if (g_session.ctx != nullptr && g_session.model != model)
+                if (g_session.ctx != nullptr && g_session.model != model && g_session.refs <= 1)
                 {
                     whisper_free(g_session.ctx);
                     g_session.ctx = nullptr;
+                    g_session.refs = 0;
                 }
                 if (g_session.ctx == nullptr)
                 {
                     g_session.ctx = whisper_init_from_file(model.c_str());
                     g_session.model = model;
+                    g_session.refs = 0;
+                }
+                if (g_session.ctx != nullptr)
+                {
+                    g_session.refs += 1;
                 }
                 jsonResult["@type"] = "sessionOpen";
                 jsonResult["ok"] = g_session.ctx != nullptr;
@@ -294,12 +304,19 @@ extern "C"
             }
             if (type == "sessionClose")
             {
-                if (g_session.ctx != nullptr)
+                if (g_session.refs > 0)
                 {
-                    whisper_free(g_session.ctx);
+                    g_session.refs -= 1;
                 }
-                g_session.ctx = nullptr;
-                g_session.model.clear();
+                if (g_session.refs == 0)
+                {
+                    if (g_session.ctx != nullptr)
+                    {
+                        whisper_free(g_session.ctx);
+                    }
+                    g_session.ctx = nullptr;
+                    g_session.model.clear();
+                }
                 jsonResult["@type"] = "sessionClose";
                 jsonResult["ok"] = true;
                 return jsonToChar(jsonResult);
