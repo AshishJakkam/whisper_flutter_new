@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -73,10 +74,62 @@ struct whisper_print_user_data
     const std::vector<std::vector<float>> *pcmf32s;
 };
 
-json transcribe(json jsonBody) noexcept
+// Reads a 16 kHz, 16-bit mono/stereo WAV into mono float samples.
+static bool loadWav16k(const std::string &path, std::vector<float> &pcmf32, std::string &error)
+{
+    drwav wav;
+    if (!drwav_init_file(&wav, path.c_str(), NULL))
+    {
+        error = " failed to open WAV file ";
+        return false;
+    }
+    if (wav.channels != 1 && wav.channels != 2)
+    {
+        drwav_uninit(&wav);
+        error = "must be mono or stereo";
+        return false;
+    }
+    if (wav.sampleRate != WHISPER_SAMPLE_RATE)
+    {
+        drwav_uninit(&wav);
+        error = "WAV file  must be 16 kHz";
+        return false;
+    }
+    if (wav.bitsPerSample != 16)
+    {
+        drwav_uninit(&wav);
+        error = "WAV file  must be 16 bit";
+        return false;
+    }
+
+    int n = wav.totalPCMFrameCount;
+    std::vector<int16_t> pcm16;
+    pcm16.resize(n * wav.channels);
+    drwav_read_pcm_frames_s16(&wav, n, pcm16.data());
+    drwav_uninit(&wav);
+
+    pcmf32.resize(n);
+    if (wav.channels == 1)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            pcmf32[i] = float(pcm16[i]) / 32768.0f;
+        }
+    }
+    else
+    {
+        for (int i = 0; i < n; i++)
+        {
+            pcmf32[i] = float(pcm16[2 * i] + pcm16[2 * i + 1]) / 65536.0f;
+        }
+    }
+    return true;
+}
+
+// Parses the wire fields both entry points accept.
+static whisper_params parseParams(json jsonBody)
 {
     whisper_params params;
-
     params.n_threads = jsonBody["threads"];
     params.verbose = jsonBody["is_verbose"];
     params.translate = jsonBody["is_translate"];
@@ -86,6 +139,98 @@ json transcribe(json jsonBody) noexcept
     params.model = jsonBody["model"];
     params.audio = jsonBody["audio"];
     params.split_on_word = jsonBody["split_on_word"];
+    return params;
+}
+
+// One inference pass over an already-loaded model. The caller owns the context's lifetime.
+static json runInference(struct whisper_context *ctx, const whisper_params &params)
+{
+    json jsonResult;
+    jsonResult["@type"] = "transcribe";
+
+    std::vector<float> pcmf32;
+    std::string error;
+    if (!loadWav16k(params.audio, pcmf32, error))
+    {
+        jsonResult["@type"] = "error";
+        jsonResult["message"] = error;
+        return jsonResult;
+    }
+
+    std::string language = params.language;
+    bool translate = params.translate;
+    if (language == "" || language == "auto")
+    {
+        language = "auto";
+        translate = false;
+    }
+
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_realtime = false;
+    wparams.print_progress = false;
+    wparams.print_timestamps = !params.no_timestamps;
+    wparams.translate = translate;
+    wparams.language = language.c_str();
+    wparams.n_threads = params.n_threads;
+    wparams.split_on_word = params.split_on_word;
+
+    if (params.split_on_word)
+    {
+        wparams.max_len = 1;
+        wparams.token_timestamps = true;
+    }
+
+    if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0)
+    {
+        jsonResult["@type"] = "error";
+        jsonResult["message"] = "failed to process audio";
+        return jsonResult;
+    }
+
+    std::string text_result = "";
+    const int n_segments = whisper_full_n_segments(ctx);
+    std::vector<json> segmentsJson = {};
+
+    for (int i = 0; i < n_segments; ++i)
+    {
+        const char *text = whisper_full_get_segment_text(ctx, i);
+        text_result += std::string(text);
+        if (!params.no_timestamps)
+        {
+            json jsonSegment;
+            jsonSegment["from_ts"] = whisper_full_get_segment_t0(ctx, i);
+            jsonSegment["to_ts"] = whisper_full_get_segment_t1(ctx, i);
+            jsonSegment["text"] = text;
+            segmentsJson.push_back(jsonSegment);
+        }
+    }
+
+    if (!params.no_timestamps)
+    {
+        jsonResult["segments"] = segmentsJson;
+    }
+    jsonResult["text"] = text_result;
+    return jsonResult;
+}
+
+// A model kept loaded for a live transcription session.
+//
+// Initialising whisper reads the whole model from flash. Measured in the app that was ~12 s of
+// every single call, which is the only reason a 5 s window took over 13 s and the live transcript
+// fell further behind. With the context kept, the same phone runs several times faster than
+// realtime, so the per-window cost becomes the audio length rather than the model size.
+struct whisper_session
+{
+    struct whisper_context *ctx = nullptr;
+    std::string model;
+};
+
+static whisper_session g_session;
+static std::mutex g_session_mutex;
+
+json transcribe(json jsonBody) noexcept
+{
+    whisper_params params = parseParams(jsonBody);
     json jsonResult;
     jsonResult["@type"] = "transcribe";
 
@@ -96,151 +241,99 @@ json transcribe(json jsonBody) noexcept
         return jsonResult;
     }
 
-    if (params.seed < 0)
-    {
-        params.seed = time(NULL);
-    }
-
-    // whisper init
     struct whisper_context *ctx = whisper_init_from_file(params.model.c_str());
-    std::string text_result = "";
-    const auto fname_inp = params.audio;
-    // WAV input
-    std::vector<float> pcmf32;
+    if (ctx == nullptr)
     {
-        drwav wav;
-        if (!drwav_init_file(&wav, fname_inp.c_str(), NULL))
-        {
-            jsonResult["@type"] = "error";
-            jsonResult["message"] = " failed to open WAV file ";
-            return jsonResult;
-        }
-
-        if (wav.channels != 1 && wav.channels != 2)
-        {
-            jsonResult["@type"] = "error";
-            jsonResult["message"] = "must be mono or stereo";
-            return jsonResult;
-        }
-
-        if (wav.sampleRate != WHISPER_SAMPLE_RATE)
-        {
-            jsonResult["@type"] = "error";
-            jsonResult["message"] = "WAV file  must be 16 kHz";
-            return jsonResult;
-        }
-
-        if (wav.bitsPerSample != 16)
-        {
-            jsonResult["@type"] = "error";
-            jsonResult["message"] = "WAV file  must be 16 bit";
-            return jsonResult;
-        }
-
-        int n = wav.totalPCMFrameCount;
-
-        std::vector<int16_t> pcm16;
-        pcm16.resize(n * wav.channels);
-        drwav_read_pcm_frames_s16(&wav, n, pcm16.data());
-        drwav_uninit(&wav);
-
-        // convert to mono, float
-        pcmf32.resize(n);
-        if (wav.channels == 1)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                pcmf32[i] = float(pcm16[i]) / 32768.0f;
-            }
-        }
-        else
-        {
-            for (int i = 0; i < n; i++)
-            {
-                pcmf32[i] = float(pcm16[2 * i] + pcm16[2 * i + 1]) / 65536.0f;
-            }
-        }
+        jsonResult["@type"] = "error";
+        jsonResult["message"] = "failed to load model";
+        return jsonResult;
     }
 
-    {
-        if (params.language == "" && params.language == "auto")
-        {
-            params.language = "auto";
-            params.translate = false;
-        }
-    }
-    // run the inference
-    {
-        whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    json result = runInference(ctx, params);
 
-        wparams.print_realtime = false;
-        wparams.print_progress = false;
-        wparams.print_timestamps = !params.no_timestamps;
-        // wparams.print_special_tokens = params.print_special_tokens;
-        wparams.translate = params.translate;
-        wparams.language = params.language.c_str();
-        wparams.n_threads = params.n_threads;
-        wparams.split_on_word = params.split_on_word;
-
-        if (params.split_on_word) {
-            wparams.max_len = 1;
-            wparams.token_timestamps = true;
-        }
-
-        if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0)
-        {
-            jsonResult["@type"] = "error";
-            jsonResult["message"] = "failed to process audio";
-            return jsonResult;
-        }
-
-        
-
-        // print result;
-        if (!wparams.print_realtime)
-        {
-
-            const int n_segments = whisper_full_n_segments(ctx);
-
-            std::vector<json> segmentsJson = {};
-
-            for (int i = 0; i < n_segments; ++i)
-            {
-                const char *text = whisper_full_get_segment_text(ctx, i);
-
-                std::string str(text);
-                text_result += str;
-                if (params.no_timestamps)
-                {
-                    // printf("%s", text);
-                    // fflush(stdout);
-                } else {
-                    json jsonSegment;
-                    const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-                    const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-
-                    // printf("[%s --> %s]  %s\n", to_timestamp(t0).c_str(), to_timestamp(t1).c_str(), text);
-
-                    jsonSegment["from_ts"] = t0;
-                    jsonSegment["to_ts"] = t1;
-                    jsonSegment["text"] = text;
-
-                    segmentsJson.push_back(jsonSegment);
-                }
-            }
-
-            if (!params.no_timestamps) {
-                jsonResult["segments"] = segmentsJson;
-            }
-        }
-    }
-    jsonResult["text"] = text_result;
-    
     whisper_free(ctx);
-    return jsonResult;
+    return result;
 }
+
 extern "C"
 {
+    // Session API: keeps one whisper_context alive across calls. Actions are
+    // sessionOpen {model}, getTextFromWavFile (same fields as request), sessionClose.
+    FUNCTION_ATTRIBUTE
+    char *session_request(char *body)
+    {
+        try
+        {
+            json jsonBody = json::parse(body);
+            json jsonResult;
+            const std::string type = jsonBody["@type"];
+
+            std::lock_guard<std::mutex> lock(g_session_mutex);
+
+            if (type == "sessionOpen")
+            {
+                const std::string model = jsonBody["model"];
+                if (g_session.ctx != nullptr && g_session.model != model)
+                {
+                    whisper_free(g_session.ctx);
+                    g_session.ctx = nullptr;
+                }
+                if (g_session.ctx == nullptr)
+                {
+                    g_session.ctx = whisper_init_from_file(model.c_str());
+                    g_session.model = model;
+                }
+                jsonResult["@type"] = "sessionOpen";
+                jsonResult["ok"] = g_session.ctx != nullptr;
+                if (g_session.ctx == nullptr)
+                {
+                    jsonResult["message"] = "failed to load model";
+                }
+                return jsonToChar(jsonResult);
+            }
+            if (type == "sessionClose")
+            {
+                if (g_session.ctx != nullptr)
+                {
+                    whisper_free(g_session.ctx);
+                }
+                g_session.ctx = nullptr;
+                g_session.model.clear();
+                jsonResult["@type"] = "sessionClose";
+                jsonResult["ok"] = true;
+                return jsonToChar(jsonResult);
+            }
+            if (type == "getTextFromWavFile")
+            {
+                if (g_session.ctx == nullptr)
+                {
+                    jsonResult["@type"] = "error";
+                    jsonResult["message"] = "session not open";
+                    return jsonToChar(jsonResult);
+                }
+                whisper_params params = parseParams(jsonBody);
+                return jsonToChar(runInference(g_session.ctx, params));
+            }
+
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "unknown session request";
+            return jsonToChar(jsonResult);
+        }
+        catch (const std::exception &e)
+        {
+            json jsonResult;
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = e.what();
+            return jsonToChar(jsonResult);
+        }
+        catch (...)
+        {
+            json jsonResult;
+            jsonResult["@type"] = "error";
+            jsonResult["message"] = "unknown error";
+            return jsonToChar(jsonResult);
+        }
+    }
     FUNCTION_ATTRIBUTE
     char *request(char *body)
     {

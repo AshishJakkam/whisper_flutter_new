@@ -133,3 +133,5 @@ class Whisper {
     return response.message;
   }
 }
+
+export "package:whisper_flutter_new/whisper_session.dart";
