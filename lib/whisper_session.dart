@@ -35,7 +35,7 @@ Future<Object?> _callNative(String body) {
 
 bool _isAvailable() {
   try {
-    _openLib().lookup<_SessionRequestNative>(_symbol);
+    _openLib().lookup<NativeFunction<_SessionRequestNative>>(_symbol);
     return true;
   } catch (_) {
     return false;
