@@ -21,6 +21,7 @@ import "package:whisper_flutter_new/whisper_bindings_generated.dart";
 
 export "package:whisper_flutter_new/bean/_models.dart";
 export "package:whisper_flutter_new/download_model.dart" show WhisperModel;
+export "package:whisper_flutter_new/whisper_session.dart";
 
 /// Entry point of whisper_flutter_plus
 class Whisper {
@@ -134,4 +135,3 @@ class Whisper {
   }
 }
 
-export "package:whisper_flutter_new/whisper_session.dart";
