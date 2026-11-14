@@ -5,6 +5,8 @@
 #include "whisper.cpp/examples/dr_wav.h"
 
 #include <cstdio>
+#include <memory>
+// OMI_WHISPER_RESOURCE_GUARDS_V1
 #include <string>
 #include <thread>
 #include <mutex>
@@ -80,25 +82,26 @@ static bool loadWav16k(const std::string &path, std::vector<float> &pcmf32, std:
     drwav wav;
     if (!drwav_init_file(&wav, path.c_str(), NULL))
     {
-        error = " failed to open WAV file ";
+        error = "OMI_STT_PERMANENT_INPUT: failed to open WAV file";
         return false;
     }
+    // RAII owns the decoder across every error return below.
+    auto wav_cleanup = [](drwav *handle) { drwav_uninit(handle); };
+    std::unique_ptr<drwav, decltype(wav_cleanup)> wav_guard(&wav, wav_cleanup);
+
     if (wav.channels != 1 && wav.channels != 2)
     {
-        drwav_uninit(&wav);
-        error = "must be mono or stereo";
+        error = "OMI_STT_PERMANENT_INPUT: must be mono or stereo";
         return false;
     }
     if (wav.sampleRate != WHISPER_SAMPLE_RATE)
     {
-        drwav_uninit(&wav);
-        error = "WAV file  must be 16 kHz";
+        error = "OMI_STT_PERMANENT_INPUT: WAV file must be 16 kHz";
         return false;
     }
     if (wav.bitsPerSample != 16)
     {
-        drwav_uninit(&wav);
-        error = "WAV file  must be 16 bit";
+        error = "OMI_STT_PERMANENT_INPUT: WAV file must be 16 bit";
         return false;
     }
 
@@ -106,7 +109,6 @@ static bool loadWav16k(const std::string &path, std::vector<float> &pcmf32, std:
     std::vector<int16_t> pcm16;
     pcm16.resize(n * wav.channels);
     drwav_read_pcm_frames_s16(&wav, n, pcm16.data());
-    drwav_uninit(&wav);
 
     pcmf32.resize(n);
     if (wav.channels == 1)
@@ -183,7 +185,7 @@ static json runInference(struct whisper_context *ctx, const whisper_params &para
     if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0)
     {
         jsonResult["@type"] = "error";
-        jsonResult["message"] = "failed to process audio";
+        jsonResult["message"] = "OMI_STT_RETRYABLE: failed to process audio";
         return jsonResult;
     }
 
@@ -237,22 +239,21 @@ json transcribe(json jsonBody) noexcept
     if (params.language != "" && params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1)
     {
         jsonResult["@type"] = "error";
-        jsonResult["message"] = "error: unknown language = " + params.language;
+        jsonResult["message"] = "OMI_STT_PERMANENT_INPUT: unknown language = " + params.language;
         return jsonResult;
     }
 
-    struct whisper_context *ctx = whisper_init_from_file(params.model.c_str());
-    if (ctx == nullptr)
+    // The per-call path owns its context for the length of one inference.
+    std::unique_ptr<whisper_context, decltype(&whisper_free)> context(
+        whisper_init_from_file(params.model.c_str()), &whisper_free);
+    if (context.get() == nullptr)
     {
         jsonResult["@type"] = "error";
-        jsonResult["message"] = "failed to load model";
+        jsonResult["message"] = "OMI_STT_MODEL_UNAVAILABLE: model could not be loaded";
         return jsonResult;
     }
 
-    json result = runInference(ctx, params);
-
-    whisper_free(ctx);
-    return result;
+    return runInference(context.get(), params);
 }
 
 extern "C"
@@ -287,7 +288,7 @@ extern "C"
                 jsonResult["ok"] = g_session.ctx != nullptr;
                 if (g_session.ctx == nullptr)
                 {
-                    jsonResult["message"] = "failed to load model";
+                    jsonResult["message"] = "OMI_STT_MODEL_UNAVAILABLE: model could not be loaded";
                 }
                 return jsonToChar(jsonResult);
             }
@@ -308,7 +309,7 @@ extern "C"
                 if (g_session.ctx == nullptr)
                 {
                     jsonResult["@type"] = "error";
-                    jsonResult["message"] = "session not open";
+                    jsonResult["message"] = "OMI_STT_MODEL_UNAVAILABLE: session not open";
                     return jsonToChar(jsonResult);
                 }
                 whisper_params params = parseParams(jsonBody);
