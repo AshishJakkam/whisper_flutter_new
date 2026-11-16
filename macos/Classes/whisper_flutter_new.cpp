@@ -15,9 +15,13 @@
 
 using json = nlohmann::json;
 
-char *jsonToChar(json jsonData) noexcept
+// Transcription output is arbitrary bytes: whisper emits invalid UTF-8 for Indic scripts, and
+// nlohmann throws type_error.316 on it. This used to be `noexcept` around a throwing dump(), so a
+// single bad byte aborted the whole app instead of returning an error string. Replace invalid
+// sequences and let allocation failures reach the caller's handler.
+char *jsonToChar(json jsonData)
 {
-    std::string result = jsonData.dump();
+    std::string result = jsonData.dump(-1, ' ', false, json::error_handler_t::replace);
     char *ch = new char[result.size() + 1];
     strcpy(ch, result.c_str());
     return ch;
@@ -73,7 +77,7 @@ struct whisper_print_user_data
     const std::vector<std::vector<float>> *pcmf32s;
 };
 
-json transcribe(json jsonBody) noexcept
+json transcribe(json jsonBody)
 {
     whisper_params params;
 
